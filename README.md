@@ -1,7 +1,7 @@
 # Noise Cancellation
 
-[![Codacy Badge](https://app.codacy.com/project/badge/Grade/e6af0d01d5ab4c7ea597850e8501aac4)](https://app.codacy.com/gh/sghaida/noise-cancelation/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
-[![Codacy Badge](https://app.codacy.com/project/badge/Coverage/e6af0d01d5ab4c7ea597850e8501aac4)](https://app.codacy.com/gh/sghaida/noise-cancelation/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_coverage)
+[![Codacy Badge](https://app.codacy.com/project/badge/Grade/51d7297e50a8409d872e572ad5ceb10d)](https://app.codacy.com/gh/sghaida/noise-cancelation/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
+[![Codacy Badge](https://app.codacy.com/project/badge/Coverage/51d7297e50a8409d872e572ad5ceb10d)](https://app.codacy.com/gh/sghaida/noise-cancelation/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_coverage)
 
 Real-time speech enhancement and noise suppression library written in Go for telephony audio such as Twilio Media Streams.
 
