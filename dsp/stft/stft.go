@@ -121,7 +121,7 @@ func (a *Analyzer) transform(samples []float32) (audio.Spectrum, error) {
 		bins[i] = complex(windowedSample, 0)
 	}
 
-	if err := fft(bins); err != nil {
+	if err := FFT(bins); err != nil {
 		return audio.Spectrum{}, fmt.Errorf("calculate FFT: %w", err)
 	}
 

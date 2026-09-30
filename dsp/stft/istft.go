@@ -77,7 +77,7 @@ func (s *Synthesizer) Process(spectrum audio.Spectrum) ([]float32, error) {
 		fullSpectrum[s.fftSize-i] = complex(real(value), -imag(value))
 	}
 
-	if err := ifft(fullSpectrum); err != nil {
+	if err := IFFT(fullSpectrum); err != nil {
 		return nil, fmt.Errorf("calculate inverse FFT: %w", err)
 	}
 

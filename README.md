@@ -78,12 +78,18 @@ suppress selected strong foreground interference
 
 ## End to End Capacity Calculation
 
-The end to end benchmark is `BenchmarkEndToEndPipeline100ConcurrentTwoMinutes` in [benchmark/end_to_end_benchmark_test.go](benchmark/end_to_end_benchmark_test.go). Each goroutine owns a complete stateful pipeline and processes shared read-only G.711 μ law packets through decode, high pass, STFT, SPP MMSE, Log MMSE, tonal transient suppression, ISTFT, and μ law encode.
+The end to end benchmarks are `BenchmarkEndToEndPipeline100ConcurrentTwoMinutes` and `BenchmarkEndToEndDTLN100CallsTwoMinutes` in [benchmark/end_to_end_benchmark_test.go](benchmark/end_to_end_benchmark_test.go). The pipeline benchmark gives each concurrent call a complete stateful telephony pipeline. The DTLN benchmark processes the same 100-call, two-minute workload through eight reusable stateful DTLN workers because each ONNX session owns native resources; each worker resets between independent calls.
 
 Run the fixed workload with:
 
 ```bash
 make bench-e2e
+```
+
+Run the DTLN workload with `ONNXRUNTIME_SHARED_LIBRARY_PATH` set as described in the DTLN runtime setup:
+
+```bash
+make bench-e2e-dtln
 ```
 
 For the reference configuration, let $C=100$ concurrent calls, $D=120$ seconds per call, $f_s=8000$ samples/second, packet duration $T_p=0.020$ seconds, FFT size $N=256$, and hop size $H=128$ samples.
@@ -95,6 +101,16 @@ For the reference configuration, let $C=100$ concurrent calls, $D=120$ seconds p
 	ext{aggregate audio} &= C D = 100 \cdot 120 = 12000\ \text{seconds} \\
 	ext{aggregate samples} &= C D f_s = 100 \cdot 120 \cdot 8000 = 96000000 \\
 	ext{packet rate} &= \frac{C}{T_p} = 5000\ \text{packets/second}
+\end{aligned}
+```
+
+DTLN uses 16 kHz PCM and a 320-sample input chunk in this benchmark:
+
+```math
+\begin{aligned}
+	ext{samples per DTLN call} &= D \cdot 16000 = 1920000 \\
+	ext{DTLN hops per call} &= \frac{1920000}{128} = 15000 \\
+	ext{aggregate DTLN hops} &= C \cdot 15000 = 1500000
 \end{aligned}
 ```
 
@@ -115,22 +131,23 @@ With streaming STFT processing, each call produces:
 
 The benchmark reports wall time, total process CPU time, CPU utilization, peak live heap, peak Go runtime memory, and cumulative allocation volume. CPU utilization is calculated as $100 \cdot \text{CPU seconds}/\text{wall seconds}$, so it can exceed 100% when multiple cores are active. The real-time capacity factor is $C D/\text{wall seconds}$; values above 1 mean the measured host can process the aggregate live audio faster than real time.
 
-One reference run on an Apple M5 Pro with Go 1.26.4 produced:
+One reference run on an Apple M5 Pro with Go 1.26.6 produced the following results. The DTLN values use eight reusable workers and the CPU utilization is measured across the complete 100-call workload.
 
-| Measurement | Result |
-| --- | ---: |
-| Calls and duration | 100 x 120 seconds |
-| Wall time | 1.291 seconds |
-| Amortized wall time per call-equivalent | 12.91 ms |
-| Total CPU time | 23.16 seconds |
-| CPU utilization | 1,795% |
-| Real-time capacity factor | 9,295x aggregate audio |
-| Peak live heap | 14.82 MiB |
-| Peak Go runtime memory | 36.74 MiB |
-| Cumulative allocations | 2,867 MiB |
-| Allocations | 4,292,205 |
+| Measurement | Pipeline result | DTLN result |
+| --- | ---: | ---: |
+| Calls and duration | 100 concurrent x 120 seconds | 100 calls x 120 seconds, 8 workers |
+| Input and output | G.711 μ law, 8 kHz | Float32 PCM, 16 kHz |
+| Wall time | 1.306 seconds | 28.07 seconds |
+| Amortized wall time per call-equivalent | 13.06 ms | 280.7 ms |
+| Total CPU time | 23.52 seconds | 497.2 seconds |
+| CPU utilization | 1,800% | 1,772% |
+| Real-time capacity factor | 9,188x aggregate audio | 428x aggregate audio |
+| Peak live heap | 13.94 MiB | 15.40 MiB |
+| Peak Go runtime memory | 36.74 MiB | 35.83 MiB |
+| Cumulative allocations | 2,867 MiB | 732.9 MiB |
+| Allocations | 4,292,821 | 604,175 |
 
-These figures are a local performance reference rather than a hardware-independent guarantee. Run `make bench-e2e` on the deployment host when sizing concurrency. The benchmark uses `-benchtime=1x` because one iteration is already the complete 100-call, two-minute workload.
+These figures are a local performance reference rather than a hardware-independent guarantee. Run `make bench-e2e` and `make bench-e2e-dtln` on the deployment host when sizing capacity. Both benchmarks use `-benchtime=1x` because one iteration is already the complete 100-call, two-minute workload.
 
 The 12.91 ms value is calculated as $1.291 / 100$ and is an amortized cost per concurrent call-equivalent, not the measured end-to-end latency of one individual call.
 
@@ -223,6 +240,113 @@ Packet bytes      160
 Telephony providers use G.711 because it is simple, low latency, and widely interoperable
 
 The DSP pipeline needs linear PCM because filtering, FFT processing, power estimation, and statistical suppression cannot be performed correctly on μ law compressed bytes
+
+### DTLN Speech Enhancer
+
+#### Purpose
+
+DTLN is an optional neural speech enhancer for 16 kHz mono PCM. It is separate
+from the reference 8 kHz telephony pipeline because the pretrained model has
+fixed audio and framing requirements.
+
+The implementation uses two recurrent ONNX stages. Stage one estimates a
+magnitude mask and preserves the input phase. Stage two refines the resulting
+time-domain block:
+
+```math
+\begin{aligned}
+X_t[k] &= \operatorname{FFT}\{x_t[n]\} \\
+M_t[k] &= f_1(|X_t[k]|) \\
+Y_t[k] &= M_t[k]X_t[k] \\
+y_{1,t}[n] &= \operatorname{IFFT}\{Y_t[k]\} \\
+y_{2,t}[n] &= f_2(y_{1,t}[n])
+\end{aligned}
+```
+
+Here $t$ is the streaming frame index, $k$ is a frequency bin, $f_1$ and
+$f_2$ are the two ONNX models, and $M_t[k]$ is the learned spectral gain.
+Frames are accumulated with a 512-sample block and a 128-sample hop. The
+pretrained model has a fixed 512-sample, or 32 ms, algorithmic latency at
+16 kHz. `Process` accepts arbitrary chunk sizes and returns complete 128-sample
+hops; `Flush` zero-pads one final partial hop and returns only samples belonging
+to the supplied input. Call `Reset` before reusing a processor for another
+stream.
+
+#### Model Download
+
+The ONNX files are distributed by the upstream [DTLN repository](https://github.com/breizhn/DTLN)
+under its `pretrained_model` directory:
+
+- [Download model_1.onnx](https://raw.githubusercontent.com/breizhn/DTLN/master/pretrained_model/model_1.onnx)
+- [Download model_2.onnx](https://raw.githubusercontent.com/breizhn/DTLN/master/pretrained_model/model_2.onnx)
+
+The repository already contains these files at `models/model_1.onnx` and
+`models/model_2.onnx`, which are also the paths returned by
+`dtln.DefaultConfig()`. To replace them with freshly downloaded copies:
+
+```bash
+curl -L https://raw.githubusercontent.com/breizhn/DTLN/master/pretrained_model/model_1.onnx \
+    -o models/model_1.onnx
+curl -L https://raw.githubusercontent.com/breizhn/DTLN/master/pretrained_model/model_2.onnx \
+    -o models/model_2.onnx
+```
+
+#### Runtime Setup
+
+The Go binding requires the native ONNX Runtime C library; adding the Go
+package alone is not enough. DTLN uses the CPU execution provider, so download
+the CPU package for your operating system and architecture from the official
+[ONNX Runtime installation guide](https://onnxruntime.ai/docs/install/) or the
+[ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases) page.
+
+| Platform | Release package | Shared library to pass to `InitializeRuntime` |
+| --- | --- | --- |
+| macOS Apple Silicon | `onnxruntime-osx-arm64-*.tgz` | `lib/libonnxruntime.dylib` |
+| macOS Intel | `onnxruntime-osx-x64-*.tgz` | `lib/libonnxruntime.dylib` |
+| Linux x64 | `onnxruntime-linux-x64-*.tgz` | `lib/libonnxruntime.so` |
+| Linux ARM64 | `onnxruntime-linux-aarch64-*.tgz` | `lib/libonnxruntime.so` |
+| Windows x64 | `onnxruntime-win-x64-*.zip` | `lib\\onnxruntime.dll` |
+
+Extract the archive and use the path to the shared library inside it. On
+Windows, install the [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
+if it is not already installed. The ONNX Runtime release must match the
+platform architecture and should be kept compatible with the version supported
+by the [Go binding](https://github.com/yalue/onnxruntime_go).
+
+For local development or the build-tagged smoke test, set the path as an
+environment variable:
+
+```bash
+# macOS or Linux
+export ONNXRUNTIME_SHARED_LIBRARY_PATH=/path/to/onnxruntime/lib/libonnxruntime.dylib
+# Linux: use libonnxruntime.so instead.
+```
+
+```powershell
+# Windows PowerShell
+$env:ONNXRUNTIME_SHARED_LIBRARY_PATH = 'C:\path\to\onnxruntime\lib\onnxruntime.dll'
+```
+
+The application can also pass the path directly. Initialize the runtime once
+per process before constructing a processor:
+
+```go
+if err := dtln.InitializeRuntime(sharedLibraryPath); err != nil {
+    return err
+}
+defer dtln.ShutdownRuntime()
+
+processor, err := dtln.New(dtln.DefaultConfig())
+if err != nil {
+    return err
+}
+defer processor.Close()
+```
+
+All processors must be closed before `ShutdownRuntime`. The processor is
+stateful and must not be shared between concurrent audio streams; method calls
+on one processor are serialized. Input samples must be finite normalized
+`float32` PCM values in the range $[-1,1]$.
 
 ### High Pass Filter
 

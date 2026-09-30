@@ -92,7 +92,7 @@ func TestBitReverse(t *testing.T) {
 func TestFFTEmpty(t *testing.T) {
 	var samples []complex64
 
-	err := fft(samples)
+	err := FFT(samples)
 	if err != nil {
 		t.Fatalf(
 			"fft() returned unexpected error: %v", err,
@@ -103,7 +103,7 @@ func TestFFTEmpty(t *testing.T) {
 func TestFFTRejectsNonPowerOfTwo(t *testing.T) {
 	samples := []complex64{1, 2, 3}
 
-	err := fft(samples)
+	err := FFT(samples)
 	if err == nil {
 		t.Fatal(
 			"fft() returned nil error for non-power-of-two input",
@@ -122,7 +122,7 @@ func TestFFTImpulse(t *testing.T) {
 		1, 0, 0, 0, 0, 0, 0, 0,
 	}
 
-	err := fft(samples)
+	err := FFT(samples)
 	if err != nil {
 		t.Fatalf("fft() returned unexpected error: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestFFTConstantSignal(t *testing.T) {
 		1, 1, 1, 1, 1, 1, 1, 1,
 	}
 
-	err := fft(samples)
+	err := FFT(samples)
 	if err != nil {
 		t.Fatalf("fft() returned unexpected error: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestFFTSingleBinSineWave(t *testing.T) {
 		samples[n] = complex(float32(math.Sin(angle)), 0)
 	}
 
-	err := fft(samples)
+	err := FFT(samples)
 	if err != nil {
 		t.Fatalf("fft() returned unexpected error: %v", err)
 	}
@@ -225,12 +225,12 @@ func TestFFTAndIFFTRoundTrip(t *testing.T) {
 		original...,
 	)
 
-	err := fft(samples)
+	err := FFT(samples)
 	if err != nil {
 		t.Fatalf("fft() returned unexpected error: %v", err)
 	}
 
-	err = ifft(samples)
+	err = IFFT(samples)
 	if err != nil {
 		t.Fatalf("ifft() returned unexpected error: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestFFTAndIFFTRoundTrip(t *testing.T) {
 func TestIFFTEmpty(t *testing.T) {
 	var samples []complex64
 
-	err := ifft(samples)
+	err := IFFT(samples)
 	if err != nil {
 		t.Fatalf("ifft() returned unexpected error: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestIFFTEmpty(t *testing.T) {
 func TestIFFTRejectsNonPowerOfTwo(t *testing.T) {
 	samples := []complex64{1, 2, 3}
 
-	err := ifft(samples)
+	err := IFFT(samples)
 	if err == nil {
 		t.Fatal("ifft() returned nil error for non-power-of-two input")
 	}
@@ -269,7 +269,7 @@ func TestFFTKnownValues(t *testing.T) {
 		1, 2, 3, 4,
 	}
 
-	err := fft(samples)
+	err := FFT(samples)
 	if err != nil {
 		t.Fatalf("fft() returned unexpected error: %v", err)
 	}

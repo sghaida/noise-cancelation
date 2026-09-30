@@ -5,11 +5,11 @@ import (
 	"math"
 )
 
-// fft calculates the discrete Fourier transform using an iterative
+// FFT calculates the discrete Fourier transform using an iterative
 // radix-2 Cooley-Tukey FFT
 // The input length must be a power of two as the algorithm is divide and conquer
 // original formula X[k]= n=0∑N−1​x[n]e^(−j2πkn/N)
-func fft(samples []complex64) error {
+func FFT(samples []complex64) error {
 	size := len(samples)
 
 	if size == 0 {
@@ -50,10 +50,10 @@ func fft(samples []complex64) error {
 	return nil
 }
 
-// ifft calculates the inverse Fourier transform
+// IFFT calculates the inverse Fourier transform
 //
 //	IFFT(X) = conjugate(FFT(conjugate(X))) / N
-func ifft(samples []complex64) error {
+func IFFT(samples []complex64) error {
 	size := len(samples)
 
 	if size == 0 {
@@ -64,7 +64,7 @@ func ifft(samples []complex64) error {
 		samples[i] = complex(real(samples[i]), -imag(samples[i]))
 	}
 
-	if err := fft(samples); err != nil {
+	if err := FFT(samples); err != nil {
 		return err
 	}
 
