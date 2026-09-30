@@ -255,10 +255,10 @@ time-domain block:
 
 ```math
 \begin{aligned}
-X_t[k] &= \operatorname{FFT}\{x_t[n]\} \\
+X_t[k] &= \mathrm{FFT}\{x_t[n]\} \\
 M_t[k] &= f_1(|X_t[k]|) \\
 Y_t[k] &= M_t[k]X_t[k] \\
-y_{1,t}[n] &= \operatorname{IFFT}\{Y_t[k]\} \\
+y_{1,t}[n] &= \mathrm{IFFT}\{Y_t[k]\} \\
 y_{2,t}[n] &= f_2(y_{1,t}[n])
 \end{aligned}
 ```
