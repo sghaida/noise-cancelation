@@ -14,9 +14,7 @@
 //
 //	y2[n] = model2(IFFT(Y1[k]))
 //
-// Streaming reconstruction uses overlap add with hop H
-//
-//	y[n] = Σm ym[n - mH]
+// # Streaming reconstruction overlaps frames separated by hop H
 //
 // # The pretrained ONNX model uses 16 kHz audio, 512 sample blocks and 128 sample hops
 //

@@ -78,7 +78,7 @@ suppress selected strong foreground interference
 
 ## End to End Capacity Calculation
 
-The end to end benchmarks are `BenchmarkEndToEndPipeline100ConcurrentTwoMinutes` and `BenchmarkEndToEndDTLN100CallsTwoMinutes` in [benchmark/end_to_end_benchmark_test.go](benchmark/end_to_end_benchmark_test.go). The pipeline benchmark gives each concurrent call a complete stateful telephony pipeline. The DTLN benchmark processes the same 100-call, two-minute workload through eight reusable stateful DTLN workers because each ONNX session owns native resources; each worker resets between independent calls.
+The end to end benchmarks are `BenchmarkEndToEndPipeline100ConcurrentTwoMinutes`, `BenchmarkEndToEndDTLN100CallsTwoMinutes`, and `BenchmarkEndToEndDTLNScheduled100ConcurrentTwoMinutes` in [benchmark/end_to_end_benchmark_test.go](benchmark/end_to_end_benchmark_test.go). The pipeline benchmark gives each concurrent call a complete stateful telephony pipeline. The historical DTLN benchmark processes complete calls through eight reusable processors. The scheduled benchmark gives all 100 streams independent recurrent state and shares inference capacity through a deadline-aware worker pool.
 
 Run the fixed workload with:
 
@@ -92,15 +92,21 @@ Run the DTLN workload with `ONNXRUNTIME_SHARED_LIBRARY_PATH` set as described in
 make bench-e2e-dtln
 ```
 
+Run the 100-stream deadline-aware DTLN workload with:
+
+```bash
+make bench-e2e-dtln-scheduled
+```
+
 For the reference configuration, let $C=100$ concurrent calls, $D=120$ seconds per call, $f_s=8000$ samples/second, packet duration $T_p=0.020$ seconds, FFT size $N=256$, and hop size $H=128$ samples.
 
 ```math
 \begin{aligned}
-	ext{packets per call} &= \frac{D}{T_p} = \frac{120}{0.020} = 6000 \\
-	ext{samples per call} &= D f_s = 120 \cdot 8000 = 960000 \\
-	ext{aggregate audio} &= C D = 100 \cdot 120 = 12000\ \text{seconds} \\
-	ext{aggregate samples} &= C D f_s = 100 \cdot 120 \cdot 8000 = 96000000 \\
-	ext{packet rate} &= \frac{C}{T_p} = 5000\ \text{packets/second}
+    ext{packets per call} &= \frac{D}{T_p} = \frac{120}{0.020} = 6000 \\
+    ext{samples per call} &= D f_s = 120 \cdot 8000 = 960000 \\
+    ext{aggregate audio} &= C D = 100 \cdot 120 = 12000\ \text{seconds} \\
+    ext{aggregate samples} &= C D f_s = 100 \cdot 120 \cdot 8000 = 96000000 \\
+    ext{packet rate} &= \frac{C}{T_p} = 5000\ \text{packets/second}
 \end{aligned}
 ```
 
@@ -108,9 +114,9 @@ DTLN uses 16 kHz PCM and a 320-sample input chunk in this benchmark:
 
 ```math
 \begin{aligned}
-	ext{samples per DTLN call} &= D \cdot 16000 = 1920000 \\
-	ext{DTLN hops per call} &= \frac{1920000}{128} = 15000 \\
-	ext{aggregate DTLN hops} &= C \cdot 15000 = 1500000
+    ext{samples per DTLN call} &= D \cdot 16000 = 1920000 \\
+    ext{DTLN hops per call} &= \frac{1920000}{128} = 15000 \\
+    ext{aggregate DTLN hops} &= C \cdot 15000 = 1500000
 \end{aligned}
 ```
 
@@ -120,36 +126,51 @@ With streaming STFT processing, each call produces:
 
 ```math
 \begin{aligned}
-	ext{complete FFT frames} &= \left\lfloor\frac{960000-N}{H}\right\rfloor + 1 = 7498 \\
-	ext{zero-padded flush frames} &= 1 \\
-	ext{total spectra} &= 7499 \\
-	ext{one-sided bins} &= \frac{N}{2}+1 = 129 \\
-	ext{aggregate FFTs} &= C \cdot 7499 = 749900 \\
-	ext{aggregate bin visits} &= C \cdot 7499 \cdot 129 = 96737100
+    ext{complete FFT frames} &= \left\lfloor\frac{960000-N}{H}\right\rfloor + 1 = 7498 \\
+    ext{zero-padded flush frames} &= 1 \\
+    ext{total spectra} &= 7499 \\
+    ext{one-sided bins} &= \frac{N}{2}+1 = 129 \\
+    ext{aggregate FFTs} &= C \cdot 7499 = 749900 \\
+    ext{aggregate bin visits} &= C \cdot 7499 \cdot 129 = 96737100
 \end{aligned}
 ```
 
-The benchmark reports wall time, total process CPU time, CPU utilization, peak live heap, peak Go runtime memory, and cumulative allocation volume. CPU utilization is calculated as $100 \cdot \text{CPU seconds}/\text{wall seconds}$, so it can exceed 100% when multiple cores are active. The real-time capacity factor is $C D/\text{wall seconds}$; values above 1 mean the measured host can process the aggregate live audio faster than real time.
+The benchmarks report wall time, process CPU time including native ONNX work, CPU utilization, memory, cumulative allocations, and 20 ms chunk latency. CPU utilization is $100 \cdot \text{CPU seconds}/\text{wall seconds}$ and can exceed 100% when multiple cores are active. The real-time capacity factor is $C D/\text{wall seconds}$.
 
-One reference run on an Apple M5 Pro with Go 1.26.6 produced the following results. The DTLN values use eight reusable workers and the CPU utilization is measured across the complete 100-call workload.
+One reference run on an Apple M5 Pro with Go 1.26.6 and ONNX Runtime 1.30.0 produced:
 
-| Measurement | Pipeline result | DTLN result |
-| --- | ---: | ---: |
-| Calls and duration | 100 concurrent x 120 seconds | 100 calls x 120 seconds, 8 workers |
-| Input and output | G.711 μ law, 8 kHz | Float32 PCM, 16 kHz |
-| Wall time | 1.306 seconds | 28.07 seconds |
-| Amortized wall time per call-equivalent | 13.06 ms | 280.7 ms |
-| Total CPU time | 23.52 seconds | 497.2 seconds |
-| CPU utilization | 1,800% | 1,772% |
-| Real-time capacity factor | 9,188x aggregate audio | 428x aggregate audio |
-| Peak live heap | 13.94 MiB | 15.40 MiB |
-| Peak Go runtime memory | 36.74 MiB | 35.83 MiB |
-| Cumulative allocations | 2,867 MiB | 732.9 MiB |
-| Allocations | 4,292,821 | 604,175 |
+| Measurement | Pipeline | DTLN, 8 whole-call workers | DTLN, 100 scheduled streams |
+| --- | ---: | ---: | ---: |
+| Calls and duration | 100 x 120 s | 100 x 120 s | 100 x 120 s |
+| Input and output | G.711 μ law, 8 kHz | Float32 PCM, 16 kHz | Float32 PCM, 16 kHz |
+| Inference workers | 100 call goroutines | 8 | 18 |
+| Wall time | 1.109 s | 28.29 s | 38.56 s |
+| Amortized wall per call-equivalent | 11.09 ms | 282.9 ms | 385.6 ms |
+| Process CPU time | 14.63 s | 217.4 s | 617.2 s |
+| CPU utilization | 1,319% | 768.5% | 1,601% |
+| Real-time capacity factor | 10,820x | 424.5x | 311.2x |
+| Peak live heap | 25.86 MiB | 12.56 MiB | 24.77 MiB |
+| Peak Go runtime memory | 52.49 MiB | 27.14 MiB | 47.46 MiB |
+| Cumulative allocations | 2,867 MiB | 0.5195 MiB | 3.850 MiB |
+| Allocations | 4,292,592 | 4,339 | 23,241 |
+| Deadline misses | Not measured | Not applicable | 0% |
 
-These figures are a local performance reference rather than a hardware-independent guarantee. Run `make bench-e2e` and `make bench-e2e-dtln` on the deployment host when sizing capacity. Both benchmarks use `-benchtime=1x` because one iteration is already the complete 100-call, two-minute workload.
+The latency percentiles measure one 20 ms method call. They do not include network transport, resampling, packet collection, or the fixed analysis delay.
 
-The 12.91 ms value is calculated as $1.291 / 100$ and is an amortized cost per concurrent call-equivalent, not the measured end-to-end latency of one individual call.
+| 20 ms chunk latency | Pipeline | DTLN, active whole-call worker | DTLN, scheduled total | Scheduled processing | Scheduled queue |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Average | 0.1631 ms | 0.3617 ms | 6.289 ms | 1.000 ms | 4.865 ms |
+| p50 | 0.01875 ms | 0.3543 ms | 6.256 ms | 1.598 ms | 6.027 ms |
+| p95 | 0.04362 ms | 0.5247 ms | 7.782 ms | 2.412 ms | 6.529 ms |
+| p99 | 0.3319 ms | 0.5748 ms | 8.933 ms | 4.871 ms | 38.56 ms |
+
+The scheduled benchmark keeps all streams continuously backlogged, so its queue percentiles represent saturated service rather than a paced network source. Deadlines follow each stream's 20 ms audio timeline; all chunks completed before their logical deadlines.
+
+Before session tuning and output reuse, the historical DTLN workload took 191.5 seconds and allocated 734.2 MiB on the earlier reference run. The current M5 Pro run takes 28.29 seconds and allocates 0.5195 MiB, a 99.9% reduction in cumulative allocation volume. A focused single-stream benchmark shows ONNX default threading at approximately 0.432 ms per chunk and one-thread execution at 0.570 ms; one-thread sessions win under high concurrency by avoiding thread-pool contention.
+
+Scheduling changes call admission latency rather than DTLN's model delay. With eight whole-call workers, only eight simultaneous calls can start; the scheduler admits all 100 streams immediately. The current scheduled run provides 8.933 ms p99 chunk service, with 2.412 ms p95 processing and 6.529 ms p95 queue latency under saturation. Adding the fixed 32 ms DTLN framing delay gives an approximate saturated p95 DSP latency floor of 39.78 ms. Reducing the fixed 32 ms requires a different model and is not achievable through runtime tuning.
+
+These figures are local references rather than hardware-independent guarantees. Run all three targets on the deployment host when sizing capacity. The fixed-workload benchmarks use `-benchtime=1x`; amortized wall time per call-equivalent is a throughput metric, not individual call latency.
 
 ## Sequence Diagram
 
@@ -340,8 +361,80 @@ processor, err := dtln.New(dtln.DefaultConfig())
 if err != nil {
     return err
 }
-defer processor.Close()
+// Defer processor.Close() for direct use. ScheduledStream.Close owns cleanup
+// after the processor is registered with a scheduler.
 ```
+
+`DefaultConfig` uses one intra-op and one inter-op ONNX thread, sequential
+execution, and full graph optimization. The single-thread defaults avoid
+oversubscribing CPU cores when many calls run concurrently. Set
+`IntraOpNumThreads` or `InterOpNumThreads` to zero to use the ONNX Runtime
+thread default; benchmark both choices on the deployment workload because
+runtime-default threading has lower isolated-call latency on some hosts.
+
+`Process` allocates its returned output for convenience. A real-time caller can
+reuse storage with `ProcessInto`; the destination capacity must hold every
+complete 128-sample hop produced by the input chunk. A 320-sample chunk needs
+up to 384 output samples because a previous partial hop may be pending.
+`FlushInto` similarly appends the final partial hop to caller-owned storage.
+
+For concurrent calls, retain one processor per stream and schedule chunks
+through a shared worker limit:
+
+```go
+scheduler, err := dtln.NewScheduler(runtime.GOMAXPROCS(0))
+if err != nil {
+    return err
+}
+defer scheduler.Close()
+
+stream, err := scheduler.NewStream(processor)
+if err != nil {
+    _ = processor.Close()
+    return err
+}
+
+output := make([]float32, 0, 3*dtln.BlockShift)
+processed, metrics, err := stream.Process(
+    ctx,
+    packetDeadline,
+    output[:0],
+    input,
+)
+```
+
+The scheduler orders queued chunks by deadline, prevents concurrent work for
+one stream, and reports queue duration, processing duration, and deadline
+misses. `ScheduledStream.Process` blocks until its buffers are no longer in
+use, so callers may reuse them immediately after it returns. Stop submitting
+new chunks before gracefully closing a call, then drain, flush through the
+scheduler, deliver the tail, and close the stream:
+
+```go
+if err := stream.Drain(ctx); err != nil {
+    return err
+}
+
+tailBuffer := make([]float32, 0, dtln.BlockShift)
+tail, metrics, err := stream.Flush(
+    ctx,
+    finalDeadline,
+    tailBuffer[:0],
+)
+if err != nil {
+    return err
+}
+sendToVoiceModel(tail)
+
+if err := stream.Close(ctx); err != nil {
+    return err
+}
+```
+
+`ScheduledStream.Close` rejects new operations, waits for active work, and
+closes its processor exactly once. It does not flush implicitly because the
+caller owns delivery of the final samples. Close every stream before calling
+the pod-wide `Scheduler.Close`, then shut down ONNX Runtime.
 
 All processors must be closed before `ShutdownRuntime`. The processor is
 stateful and must not be shared between concurrent audio streams; method calls
@@ -2118,42 +2211,42 @@ go test ./dsp/interference -bench TonalTransient -benchmem -run '^$'
 Current measured results
 
 The following results were measured on `darwin/arm64` using an Apple M5 Pro
-Each value below is the arithmetic mean of the three runs shown by the benchmark output
+Each value below is the arithmetic mean of three focused benchmark runs
 Initialization benchmarks measure construction and steady state benchmarks measure the warmed up processing path
 
 | Package | Benchmark | Mean time | Memory | Allocations |
 | --- | --- | ---: | ---: | ---: |
-| `audio` | RMS, 160 samples | 42.15 ns | 0 B | 0 |
-| `audio` | RMS, 960 samples | 219.57 ns | 0 B | 0 |
-| `audio` | EnsurePower, 256 FFT | 44.34 ns | 0 B | 0 |
-| `audio` | EnsurePower, 2048 FFT | 334.37 ns | 0 B | 0 |
-| `stft` | STFT process, 160-sample chunk | 3.117 microseconds | 2,296 B | 3 |
-| `stft` | STFT process, 128-sample hop | 2.484 microseconds | 1,840 B | 3 |
-| `stft` | STFT initialization | 1.013 microseconds | 5,216 B | 4 |
-| `stft` | ISTFT process | 2.808 microseconds | 512 B | 1 |
-| `stft` | ISTFT initialization | 1.038 microseconds | 5,248 B | 5 |
-| `noise` | MCRA process | 431.5 ns | 0 B | 0 |
-| `noise` | MCRA speech probability | 76.70 ns | 0 B | 0 |
-| `noise` | MCRA initialization | 502.73 ns | 3,696 B | 7 |
-| `noise` | SPP MMSE process | 882.23 ns | 0 B | 0 |
-| `noise` | SPP MMSE speech probability | 4.254 ns | 0 B | 0 |
-| `noise` | SPP MMSE initialization | 358.93 ns | 2,880 B | 4 |
-| `interference` | Tonal transient process | 619.23 ns | 0 B | 0 |
-| `interference` | Tonal transient, moving tone | 620.53 ns | 0 B | 0 |
-| `interference` | Tonal transient, flat spectrum | 580.77 ns | 0 B | 0 |
-| `interference` | Tonal transient gain application | 123.63 ns | 0 B | 0 |
-| `interference` | Tonal transient initialization | 684.30 ns | 4,928 B | 9 |
+| `audio` | RMS, 160 samples | 44.56 ns | 0 B | 0 |
+| `audio` | RMS, 960 samples | 227.2 ns | 0 B | 0 |
+| `audio` | EnsurePower, 256 FFT | 45.74 ns | 0 B | 0 |
+| `audio` | EnsurePower, 2048 FFT | 341.7 ns | 0 B | 0 |
+| `stft` | STFT process, 160-sample chunk | 3.230 microseconds | 2,296 B | 3 |
+| `stft` | STFT process, 128-sample hop | 2.564 microseconds | 1,840 B | 3 |
+| `stft` | STFT initialization | 1.027 microseconds | 5,216 B | 4 |
+| `stft` | ISTFT process | 2.870 microseconds | 512 B | 1 |
+| `stft` | ISTFT initialization | 1.097 microseconds | 5,248 B | 5 |
+| `noise` | MCRA process | 441.5 ns | 0 B | 0 |
+| `noise` | MCRA speech probability | 80.97 ns | 0 B | 0 |
+| `noise` | MCRA initialization | 546.33 ns | 3,696 B | 7 |
+| `noise` | SPP MMSE process | 901.4 ns | 0 B | 0 |
+| `noise` | SPP MMSE speech probability | 4.352 ns | 0 B | 0 |
+| `noise` | SPP MMSE initialization | 364.9 ns | 2,880 B | 4 |
+| `interference` | Tonal transient process | 651.2 ns | 0 B | 0 |
+| `interference` | Tonal transient, moving tone | 647.8 ns | 0 B | 0 |
+| `interference` | Tonal transient, flat spectrum | 605.7 ns | 0 B | 0 |
+| `interference` | Tonal transient gain application | 129.3 ns | 0 B | 0 |
+| `interference` | Tonal transient initialization | 701.5 ns | 4,928 B | 9 |
 
 The benchmark output also measured these MCRA and SPP MMSE baseline paths:
 
 ```text
-MCRA baseline process       433.20 ns/op   0 B/op   0 allocs/op
-MCRA baseline update         87.60 ns/op   0 B/op   0 allocs/op
-SPP MMSE baseline update    161.07 ns/op   0 B/op   0 allocs/op
+MCRA baseline process       439.0 ns/op    0 B/op   0 allocs/op
+MCRA baseline update         98.36 ns/op   0 B/op   0 allocs/op
+SPP MMSE baseline update    162.53 ns/op   0 B/op   0 allocs/op
 ```
 
-The Log MMSE, decision-directed SNR, high-pass, codec, and complete pipeline stages were not included in the supplied benchmark output
-They must be measured separately before these results can be treated as an end-to-end benchmark
+The focused package benchmark excludes Log MMSE, decision-directed SNR, high-pass, codec, and complete pipeline stages
+The dedicated end-to-end targets above measure the complete pipeline and DTLN workloads separately
 
 At 8 kHz with a 128 sample hop
 
@@ -2189,33 +2282,33 @@ For one call, the directly measured CPU time per wall-clock second is:
 
 ```math
 \begin{aligned}
-T_{\mathrm{SPP}} &= 50(3.117\ \mu s) \\
-&\quad + 62.5(0.882+0.619+0.124+2.808)\ \mu s \\
-&= 432.9\ \mu s/s
+    T_{\mathrm{SPP}} &= 50(3.230\ \mu s) \\
+&\quad + 62.5(0.901+0.651+0.129+2.870)\ \mu s \\
+&= 446.0\ \mu s/s
 \end{aligned}
 ```
 The terms are STFT, SPP MMSE, tonal transient processing, interference gain application, and ISTFT
-The power recomputation, high-pass, codec, SNR, Log MMSE, pipeline wrapper, scheduling, and I/O are excluded because matching benchmark results were not supplied
+The power recomputation, high-pass, codec, SNR, Log MMSE, pipeline wrapper, scheduling, and I/O are excluded from this stage-only estimate; the complete workloads are measured in the end-to-end benchmarks above
 
 For 100 concurrent calls lasting 120 seconds:
 
 | Estimate | Calculation | Result |
 | --- | --- | ---: |
-| CPU utilization equivalent | `100 x 432.9 microseconds/s` | 43.29 ms CPU/s, or **4.33% of one logical core** |
-| CPU time over the call interval | `43.29 ms/s x 120 s` | **5.19 CPU-seconds** |
+| CPU utilization equivalent | `100 x 446.0 microseconds/s` | 44.60 ms CPU/s, or **4.46% of one logical core** |
+| CPU time over the call interval | `44.60 ms/s x 120 s` | **5.35 CPU-seconds** |
 | SPP steady-state allocations | `100 x (50 x 2,296 + 62.5 x 512) B/s` | **14.68 MB/s allocated** |
 | SPP steady-state allocations over two minutes | `14.68 MB/s x 120 s` | **1.76 GB allocated transiently** |
 
 The MCRA alternative changes only the noise-estimator term:
 
 ```math
-50(3.117\ \mu s)
+50(3.230\ \mu s)
 +
-62.5(0.432+0.619+0.124+2.808)\ \mu s
+62.5(0.442+0.651+0.129+2.870)\ \mu s
 =
-404.8\ \mu s/s
+417.3\ \mu s/s
 ```
-That is approximately **4.05% of one logical core for 100 concurrent calls**, or **4.86 CPU-seconds over 120 seconds**, before the same unmeasured stages are added
+That is approximately **4.17% of one logical core for 100 concurrent calls**, or **5.01 CPU-seconds over 120 seconds**, before the same unmeasured stages are added
 
 ### Memory Estimate
 

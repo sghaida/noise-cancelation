@@ -167,6 +167,70 @@ func TestProcessorChunkingAndFlush(t *testing.T) {
 	}
 }
 
+func TestProcessorProcessInto(t *testing.T) {
+	mask := make([]float32, SpectrumBins)
+	for i := range mask {
+		mask[i] = 1
+	}
+
+	samples := make([]float32, BlockShift*2)
+	for i := range samples {
+		samples[i] = float32(math.Sin(float64(i)*0.03)) * 0.5
+	}
+
+	regular := newTestProcessor(&fakeModelRunner{output: mask}, &fakeModelRunner{})
+	want, err := regular.Process(samples)
+	if err != nil {
+		t.Fatalf("Process() error: %v", err)
+	}
+
+	processor := newTestProcessor(&fakeModelRunner{output: mask}, &fakeModelRunner{})
+	buffer := make([]float32, 0, len(samples))
+	got, err := processor.ProcessInto(buffer, samples)
+	if err != nil {
+		t.Fatalf("ProcessInto() error: %v", err)
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("ProcessInto() output length = %d, want %d", len(got), len(want))
+	}
+
+	for i := range want {
+		if math.Abs(float64(got[i]-want[i])) > 1e-5 {
+			t.Fatalf("ProcessInto() sample %d = %v, want %v", i, got[i], want[i])
+		}
+	}
+
+	insufficient := newTestProcessor(&fakeModelRunner{output: mask}, &fakeModelRunner{})
+	if _, err := insufficient.ProcessInto(nil, samples); err == nil {
+		t.Fatal("ProcessInto() accepted insufficient output capacity")
+	}
+}
+
+func TestProcessorProcessIntoAllocs(t *testing.T) {
+	mask := make([]float32, SpectrumBins)
+	for i := range mask {
+		mask[i] = 1
+	}
+
+	processor := newTestProcessor(
+		&fakeModelRunner{output: mask},
+		&fakeModelRunner{output: make([]float32, BlockLength)},
+	)
+	samples := make([]float32, BlockShift)
+	output := make([]float32, 0, BlockShift)
+
+	allocations := testing.AllocsPerRun(100, func() {
+		if _, err := processor.ProcessInto(output[:0], samples); err != nil {
+			t.Fatalf("ProcessInto() error: %v", err)
+		}
+	})
+
+	if allocations != 0 {
+		t.Fatalf("ProcessInto() allocations = %v, want 0", allocations)
+	}
+}
+
 func processTestInput(t *testing.T, input, mask []float32, chunked bool) []float32 {
 	t.Helper()
 
@@ -276,6 +340,71 @@ func TestProcessorFlushIsIdempotent(t *testing.T) {
 
 	if len(second) != 0 {
 		t.Fatalf("second flush length = %d, want 0", len(second))
+	}
+}
+
+func TestProcessorFlushInto(t *testing.T) {
+	processor := newTestProcessor(
+		&fakeModelRunner{output: make([]float32, SpectrumBins)},
+		&fakeModelRunner{output: make([]float32, BlockLength)},
+	)
+	samples := make([]float32, BlockShift+37)
+	processOutput := make([]float32, 0, BlockShift)
+	if _, err := processor.ProcessInto(processOutput, samples); err != nil {
+		t.Fatalf("ProcessInto() error: %v", err)
+	}
+
+	if _, err := processor.FlushInto(nil); err == nil {
+		t.Fatal("FlushInto() accepted insufficient output capacity")
+	}
+	if processor.pendingCount != 37 {
+		t.Fatalf("pending count after capacity error = %d, want 37", processor.pendingCount)
+	}
+
+	prefix := []float32{0.25}
+	outputBuffer := make([]float32, len(prefix), len(prefix)+37)
+	copy(outputBuffer, prefix)
+	output, err := processor.FlushInto(outputBuffer)
+	if err != nil {
+		t.Fatalf("FlushInto() error: %v", err)
+	}
+	if len(output) != len(prefix)+37 {
+		t.Fatalf("FlushInto() output length = %d, want %d", len(output), len(prefix)+37)
+	}
+	if output[0] != prefix[0] {
+		t.Fatalf("FlushInto() prefix = %v, want %v", output[0], prefix[0])
+	}
+
+	second, err := processor.FlushInto(output[:0])
+	if err != nil {
+		t.Fatalf("second FlushInto() error: %v", err)
+	}
+	if len(second) != 0 {
+		t.Fatalf("second FlushInto() length = %d, want 0", len(second))
+	}
+}
+
+func TestProcessorFlushIntoAllocs(t *testing.T) {
+	processor := newTestProcessor(
+		&fakeModelRunner{output: make([]float32, SpectrumBins)},
+		&fakeModelRunner{output: make([]float32, BlockLength)},
+	)
+	samples := make([]float32, BlockShift+1)
+	processOutput := make([]float32, 0, BlockShift)
+	flushOutput := make([]float32, 0, 1)
+
+	allocations := testing.AllocsPerRun(100, func() {
+		processor.Reset()
+		if _, err := processor.ProcessInto(processOutput[:0], samples); err != nil {
+			t.Fatalf("ProcessInto() error: %v", err)
+		}
+		if _, err := processor.FlushInto(flushOutput[:0]); err != nil {
+			t.Fatalf("FlushInto() error: %v", err)
+		}
+	})
+
+	if allocations != 0 {
+		t.Fatalf("ProcessInto() and FlushInto() allocations = %v, want 0", allocations)
 	}
 }
 
@@ -394,7 +523,7 @@ func TestNewWithModelFactory(t *testing.T) {
 	originalReady := isRuntimeReady
 	originalFactory := modelStageFactory
 	isRuntimeReady = func() bool { return true }
-	modelStageFactory = func(string, ort.Shape) (modelRunner, error) {
+	modelStageFactory = func(string, ort.Shape, Config) (modelRunner, error) {
 		return &fakeModelRunner{}, nil
 	}
 	defer func() {
@@ -421,7 +550,7 @@ func TestNewModelFactoryErrors(t *testing.T) {
 		modelStageFactory = originalFactory
 	}()
 
-	modelStageFactory = func(string, ort.Shape) (modelRunner, error) {
+	modelStageFactory = func(string, ort.Shape, Config) (modelRunner, error) {
 		return nil, errors.New("model creation failed")
 	}
 	if _, err := New(Config{Model1Path: "one", Model2Path: "two"}); err == nil {
@@ -430,7 +559,7 @@ func TestNewModelFactoryErrors(t *testing.T) {
 
 	first := &fakeModelRunner{}
 	callCount := 0
-	modelStageFactory = func(string, ort.Shape) (modelRunner, error) {
+	modelStageFactory = func(string, ort.Shape, Config) (modelRunner, error) {
 		callCount++
 		if callCount == 1 {
 			return first, nil

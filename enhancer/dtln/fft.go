@@ -68,11 +68,9 @@ func applyMask(spectrum []complex64, mask []float32) error {
 
 // inverseSpectrum reconstructs the real time domain frame
 //
-// Real FFT symmetry is:
+// # Upper frequency bins are complex conjugates of matching lower bins
 //
-//	X[N-k] = conj(X[k])
-//
-// The reconstructed frame is:
+// The reconstructed frame is
 //
 //	x[n] = IFFT{X[k]}
 func inverseSpectrum(spectrum []complex64, output []float32) error {

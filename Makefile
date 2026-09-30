@@ -5,7 +5,7 @@ GOLANGCI_LINT := $(shell go env GOPATH)/bin/golangci-lint
 COVERAGE_PACKAGES := $(filter-out %/smoke,$(shell go list ./...))
 
 .PHONY: test test-race cover cover-race cover-check coverage clean \
-	bench bench-all bench-e2e bench-e2e-dtln golintcli lint \
+	bench bench-all bench-e2e bench-e2e-dtln bench-e2e-dtln-scheduled golintcli lint \
 	smoke-highpass smoke-stft smoke-logmmse \
 	smoke-mcra smoke-sppmmse smoke-tonal-transient smoke-dtln
 
@@ -80,6 +80,14 @@ bench-e2e-dtln:
 		./benchmark \
 		-run=^$$ \
 		-bench='^BenchmarkEndToEndDTLN100CallsTwoMinutes$$' \
+		-benchmem \
+		-benchtime=1x
+
+bench-e2e-dtln-scheduled:
+	go test \
+		./benchmark \
+		-run=^$$ \
+		-bench='^BenchmarkEndToEndDTLNScheduled100ConcurrentTwoMinutes$$' \
 		-benchmem \
 		-benchtime=1x
 

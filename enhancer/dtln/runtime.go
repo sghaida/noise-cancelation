@@ -8,11 +8,16 @@ import (
 )
 
 var (
-	runtimeMu             sync.Mutex
-	activeProcessors      int
-	isRuntimeReady        = ort.IsInitialized
+	// runtimeMu protects process wide runtime ownership state
+	runtimeMu sync.Mutex
+	// activeProcessors counts processors that reserve the runtime
+	activeProcessors int
+	// isRuntimeReady reports whether ONNX Runtime is initialized
+	isRuntimeReady = ort.IsInitialized
+	// initializeEnvironment starts ONNX Runtime and can be replaced by tests
 	initializeEnvironment = ort.InitializeEnvironment
-	destroyEnvironment    = ort.DestroyEnvironment
+	// destroyEnvironment stops ONNX Runtime and can be replaced by tests
+	destroyEnvironment = ort.DestroyEnvironment
 )
 
 // InitializeRuntime initializes the process wide ONNX Runtime environment
@@ -64,7 +69,7 @@ func ShutdownRuntime() error {
 	return nil
 }
 
-// acquireRuntime reserves the initialized process-wide runtime for one processor.
+// acquireRuntime reserves the initialized process wide runtime for one processor
 func acquireRuntime() error {
 	runtimeMu.Lock()
 	defer runtimeMu.Unlock()
@@ -78,7 +83,7 @@ func acquireRuntime() error {
 	return nil
 }
 
-// releaseRuntime releases a processor's runtime reservation.
+// releaseRuntime releases a processor runtime reservation
 func releaseRuntime() {
 	runtimeMu.Lock()
 	defer runtimeMu.Unlock()

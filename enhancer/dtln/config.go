@@ -2,6 +2,7 @@ package dtln
 
 import "fmt"
 
+// DTLN framing and recurrent model dimensions
 const (
 	// SampleRate is the fixed sample rate expected by the pretrained DTLN model
 	SampleRate = 16000
@@ -29,15 +30,23 @@ const (
 
 // Config configures a DTLN processor
 type Config struct {
+	// Model1Path identifies the spectral masking ONNX model
 	Model1Path string
+	// Model2Path identifies the time domain refinement ONNX model
 	Model2Path string
+	// IntraOpNumThreads controls threads used within ONNX operations
+	IntraOpNumThreads int
+	// InterOpNumThreads controls threads used across ONNX operations
+	InterOpNumThreads int
 }
 
 // DefaultConfig returns paths for models stored in the repository model directory
 func DefaultConfig() Config {
 	return Config{
-		Model1Path: "models/model_1.onnx",
-		Model2Path: "models/model_2.onnx",
+		Model1Path:        "models/model_1.onnx",
+		Model2Path:        "models/model_2.onnx",
+		IntraOpNumThreads: 1,
+		InterOpNumThreads: 1,
 	}
 }
 
@@ -49,6 +58,14 @@ func (c Config) validate() error {
 
 	if c.Model2Path == "" {
 		return fmt.Errorf("DTLN model 2 path is required")
+	}
+
+	if c.IntraOpNumThreads < 0 {
+		return fmt.Errorf("DTLN intra-op thread count cannot be negative")
+	}
+
+	if c.InterOpNumThreads < 0 {
+		return fmt.Errorf("DTLN inter-op thread count cannot be negative")
 	}
 
 	return nil

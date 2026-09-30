@@ -10,11 +10,11 @@ import (
 	ort "github.com/yalue/onnxruntime_go"
 )
 
-var (
-	_ enhancer.Enhancer = (*Processor)(nil)
+// Processor implements the enhancer interface
+var _ enhancer.Enhancer = (*Processor)(nil)
 
-	errProcessorClosed = errors.New("DTLN processor is closed")
-)
+// errProcessorClosed reports use after processor shutdown
+var errProcessorClosed = errors.New("DTLN processor is closed")
 
 // Processor performs stateful streaming DTLN speech enhancement
 //
@@ -52,14 +52,14 @@ func New(cfg Config) (*Processor, error) {
 
 	runtimeOwned := true
 
-	model1, err := modelStageFactory(cfg.Model1Path, ort.NewShape(1, 1, SpectrumBins))
+	model1, err := modelStageFactory(cfg.Model1Path, ort.NewShape(1, 1, SpectrumBins), cfg)
 	if err != nil {
 		releaseRuntime()
 
 		return nil, fmt.Errorf("create DTLN model 1: %w", err)
 	}
 
-	model2, err := modelStageFactory(cfg.Model2Path, ort.NewShape(1, 1, BlockLength))
+	model2, err := modelStageFactory(cfg.Model2Path, ort.NewShape(1, 1, BlockLength), cfg)
 	if err != nil {
 		_ = model1.close()
 		releaseRuntime()
@@ -82,24 +82,64 @@ func New(cfg Config) (*Processor, error) {
 
 // Process accepts arbitrary sized 16 kHz PCM chunks and returns all complete DTLN hops currently available
 func (p *Processor) Process(samples []float32) ([]float32, error) {
+	return p.process(nil, samples, true)
+}
+
+// ProcessInto appends complete DTLN hops to dst without allocating
+func (p *Processor) ProcessInto(dst []float32, samples []float32) ([]float32, error) {
+	return p.process(dst, samples, false)
+}
+
+// process validates input and chooses allocating or caller owned output storage
+func (p *Processor) process(dst []float32, samples []float32, allowAllocation bool) ([]float32, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.closed {
-		return nil, errProcessorClosed
+	if err := p.validateProcessInput(samples); err != nil {
+		return nil, err
 	}
-
 	if len(samples) == 0 {
 		return nil, nil
 	}
 
-	if err := validateSamples(samples); err != nil {
+	output, err := p.prepareProcessOutput(dst, len(samples), allowAllocation)
+	if err != nil {
 		return nil, err
 	}
 
-	hopCount := (p.pendingCount + len(samples)) / BlockShift
-	output := make([]float32, 0, hopCount*BlockShift)
+	return p.processSamples(output, samples)
+}
 
+// validateProcessInput rejects closed processors and invalid normalized samples
+func (p *Processor) validateProcessInput(samples []float32) error {
+	if p.closed {
+		return errProcessorClosed
+	}
+
+	return validateSamples(samples)
+}
+
+// prepareProcessOutput ensures storage for every complete hop available after input
+func (p *Processor) prepareProcessOutput(dst []float32, sampleCount int, allowAllocation bool) ([]float32, error) {
+	hopCount := (p.pendingCount + sampleCount) / BlockShift
+	requiredCapacity := hopCount * BlockShift
+	availableCapacity := cap(dst) - len(dst)
+	if availableCapacity >= requiredCapacity {
+		return dst, nil
+	}
+	if !allowAllocation {
+		return nil, fmt.Errorf(
+			"DTLN output capacity is %d samples, need %d",
+			availableCapacity,
+			requiredCapacity,
+		)
+	}
+
+	return make([]float32, 0, len(dst)+requiredCapacity), nil
+}
+
+// processSamples consumes complete hops and retains the final partial hop
+func (p *Processor) processSamples(dst []float32, samples []float32) ([]float32, error) {
 	if p.pendingCount > 0 {
 		required := BlockShift - p.pendingCount
 
@@ -117,7 +157,7 @@ func (p *Processor) Process(samples []float32) ([]float32, error) {
 			return nil, err
 		}
 
-		output = append(output, hop...)
+		dst = append(dst, hop...)
 		samples = samples[required:]
 		p.pendingCount = 0
 		clear(p.pending[:])
@@ -129,7 +169,7 @@ func (p *Processor) Process(samples []float32) ([]float32, error) {
 			return nil, err
 		}
 
-		output = append(output, hop...)
+		dst = append(dst, hop...)
 		samples = samples[BlockShift:]
 	}
 
@@ -138,7 +178,7 @@ func (p *Processor) Process(samples []float32) ([]float32, error) {
 		p.pendingCount = len(samples)
 	}
 
-	return output, nil
+	return dst, nil
 }
 
 // processHop performs one complete DTLN inference step
@@ -154,9 +194,7 @@ func (p *Processor) Process(samples []float32) ([]float32, error) {
 //	y1[n] = IFFT{Y1[k]}
 //	y2[n] = model2(y1[n])
 //
-// Streaming output uses overlap add with hop H:
-//
-//	y[n] = Σm ym[n - mH]
+// Streaming output combines overlapping frames separated by hop H
 func (p *Processor) processHop(samples []float32) ([]float32, error) {
 	if len(samples) != BlockShift {
 		return nil, fmt.Errorf("DTLN hop contains %d samples, want %d", len(samples), BlockShift)
@@ -188,6 +226,7 @@ func (p *Processor) processHop(samples []float32) ([]float32, error) {
 	return p.hopOutput, nil
 }
 
+// prepareInput advances the analysis block and calculates its magnitude spectrum
 func (p *Processor) prepareInput(samples []float32) error {
 	copy(p.inputBuffer, p.inputBuffer[BlockShift:])
 	copy(p.inputBuffer[BlockLength-BlockShift:], samples)
@@ -195,6 +234,7 @@ func (p *Processor) prepareInput(samples []float32) error {
 	return forwardSpectrum(p.inputBuffer, p.spectrum, p.magnitude)
 }
 
+// runStageOne estimates and applies the spectral magnitude mask
 func (p *Processor) runStageOne() error {
 	mask, err := p.model1.run(p.magnitude)
 	if err != nil {
@@ -204,6 +244,7 @@ func (p *Processor) runStageOne() error {
 	return applyMask(p.spectrum, mask)
 }
 
+// accumulateOutput overlaps one enhanced block and exposes the next clipped hop
 func (p *Processor) accumulateOutput(enhanced []float32) {
 	copy(p.outputBuffer, p.outputBuffer[BlockShift:])
 	clear(p.outputBuffer[BlockLength-BlockShift:])
@@ -225,6 +266,16 @@ func (p *Processor) accumulateOutput(enhanced []float32) {
 
 // Flush zero pads the final incomplete hop and returns only samples belonging to the original input
 func (p *Processor) Flush() ([]float32, error) {
+	return p.flush(nil, true)
+}
+
+// FlushInto appends the final incomplete hop to dst without allocating
+func (p *Processor) FlushInto(dst []float32) ([]float32, error) {
+	return p.flush(dst, false)
+}
+
+// flush emits pending samples with optional output allocation
+func (p *Processor) flush(dst []float32, allowAllocation bool) ([]float32, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -233,10 +284,22 @@ func (p *Processor) Flush() ([]float32, error) {
 	}
 
 	if p.pendingCount == 0 {
-		return nil, nil
+		return dst, nil
 	}
 
 	validSamples := p.pendingCount
+	availableCapacity := cap(dst) - len(dst)
+	if availableCapacity < validSamples {
+		if !allowAllocation {
+			return nil, fmt.Errorf(
+				"DTLN flush output capacity is %d samples, need %d",
+				availableCapacity,
+				validSamples,
+			)
+		}
+
+		dst = make([]float32, 0, len(dst)+validSamples)
+	}
 
 	var padded [BlockShift]float32
 	copy(padded[:], p.pending[:p.pendingCount])
@@ -249,10 +312,7 @@ func (p *Processor) Flush() ([]float32, error) {
 		return nil, err
 	}
 
-	output := make([]float32, validSamples)
-	copy(output, hop[:validSamples])
-
-	return output, nil
+	return append(dst, hop[:validSamples]...), nil
 }
 
 // Reset clears all audio buffers and recurrent model states
@@ -311,6 +371,7 @@ func (p *Processor) Close() error {
 	return errors.Join(model1Err, model2Err)
 }
 
+// validateSamples verifies finite normalized PCM input
 func validateSamples(samples []float32) error {
 	if err := validateFiniteValues(samples, "sample"); err != nil {
 		return err
@@ -325,6 +386,7 @@ func validateSamples(samples []float32) error {
 	return nil
 }
 
+// validateFiniteValues rejects nonfinite tensor or sample values
 func validateFiniteValues(values []float32, name string) error {
 	for index, value := range values {
 		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {

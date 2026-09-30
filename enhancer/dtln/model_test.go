@@ -2,6 +2,7 @@ package dtln
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -31,10 +32,60 @@ func (t *fakeModelTensor) Destroy() error {
 	return t.destroyErr
 }
 
+func (t *fakeModelTensor) native() ort.Value {
+	return nil
+}
+
 type fakeModelSession struct {
 	runError     error
 	destroyError error
 	runCount     int
+}
+
+type fakeSessionOptions struct {
+	executionMode     ort.ExecutionMode
+	optimizationLevel ort.GraphOptimizationLevel
+	intraOpThreads    int
+	interOpThreads    int
+	failAt            string
+	destroyCount      int
+}
+
+func (o *fakeSessionOptions) SetExecutionMode(mode ort.ExecutionMode) error {
+	o.executionMode = mode
+	return o.settingError("execution")
+}
+
+func (o *fakeSessionOptions) SetGraphOptimizationLevel(level ort.GraphOptimizationLevel) error {
+	o.optimizationLevel = level
+	return o.settingError("optimization")
+}
+
+func (o *fakeSessionOptions) SetIntraOpNumThreads(threads int) error {
+	o.intraOpThreads = threads
+	return o.settingError("intra-op")
+}
+
+func (o *fakeSessionOptions) SetInterOpNumThreads(threads int) error {
+	o.interOpThreads = threads
+	return o.settingError("inter-op")
+}
+
+func (o *fakeSessionOptions) Destroy() error {
+	o.destroyCount++
+	return nil
+}
+
+func (o *fakeSessionOptions) native() *ort.SessionOptions {
+	return nil
+}
+
+func (o *fakeSessionOptions) settingError(name string) error {
+	if o.failAt == name {
+		return errors.New("setting failed")
+	}
+
+	return nil
 }
 
 func (s *fakeModelSession) Run() error {
@@ -57,6 +108,13 @@ func TestDefaultConfig(t *testing.T) {
 	if config.Model2Path != "models/model_2.onnx" {
 		t.Fatalf("model 2 path = %q, want models/model_2.onnx", config.Model2Path)
 	}
+	if config.IntraOpNumThreads != 1 || config.InterOpNumThreads != 1 {
+		t.Fatalf(
+			"default thread counts = %d and %d, want 1 and 1",
+			config.IntraOpNumThreads,
+			config.InterOpNumThreads,
+		)
+	}
 
 	if err := config.validate(); err != nil {
 		t.Fatalf("default config validation: %v", err)
@@ -71,6 +129,8 @@ func TestConfigValidate(t *testing.T) {
 	}{
 		{name: "missing model 1", config: Config{Model2Path: "model-2"}, want: "model 1"},
 		{name: "missing model 2", config: Config{Model1Path: "model-1"}, want: "model 2"},
+		{name: "negative intra-op threads", config: Config{Model1Path: "model-1", Model2Path: "model-2", IntraOpNumThreads: -1}, want: "intra-op"},
+		{name: "negative inter-op threads", config: Config{Model1Path: "model-1", Model2Path: "model-2", InterOpNumThreads: -1}, want: "inter-op"},
 	}
 
 	for _, test := range tests {
@@ -128,6 +188,62 @@ func TestStateShape(t *testing.T) {
 	}
 }
 
+func TestNewSessionOptions(t *testing.T) {
+	originalFactory := sessionOptionsFactory
+	defer func() { sessionOptionsFactory = originalFactory }()
+
+	options := &fakeSessionOptions{}
+	sessionOptionsFactory = func() (modelSessionOptions, error) {
+		return options, nil
+	}
+
+	config := Config{IntraOpNumThreads: 2, InterOpNumThreads: 3}
+	created, err := newSessionOptions(config)
+	if err != nil {
+		t.Fatalf("newSessionOptions() error: %v", err)
+	}
+	if created != options {
+		t.Fatal("newSessionOptions() returned different options")
+	}
+	if options.executionMode != ort.ExecutionModeSequential {
+		t.Fatalf("execution mode = %v, want sequential", options.executionMode)
+	}
+	if options.optimizationLevel != ort.GraphOptimizationLevelEnableAll {
+		t.Fatalf("optimization = %v, want enable all", options.optimizationLevel)
+	}
+	if options.intraOpThreads != 2 || options.interOpThreads != 3 {
+		t.Fatalf("thread counts = %d and %d, want 2 and 3", options.intraOpThreads, options.interOpThreads)
+	}
+}
+
+func TestNewSessionOptionsErrors(t *testing.T) {
+	originalFactory := sessionOptionsFactory
+	defer func() { sessionOptionsFactory = originalFactory }()
+
+	sessionOptionsFactory = func() (modelSessionOptions, error) {
+		return nil, errors.New("create failed")
+	}
+	if _, err := newSessionOptions(Config{}); err == nil {
+		t.Fatal("newSessionOptions() returned nil creation error")
+	}
+
+	for _, setting := range []string{"execution", "optimization", "intra-op", "inter-op"} {
+		t.Run(setting, func(t *testing.T) {
+			options := &fakeSessionOptions{failAt: setting}
+			sessionOptionsFactory = func() (modelSessionOptions, error) {
+				return options, nil
+			}
+
+			if _, err := newSessionOptions(Config{}); err == nil {
+				t.Fatal("newSessionOptions() returned nil setting error")
+			}
+			if options.destroyCount != 1 {
+				t.Fatalf("destroy count = %d, want 1", options.destroyCount)
+			}
+		})
+	}
+}
+
 func TestValidateFiniteValues(t *testing.T) {
 	if err := validateFiniteValues([]float32{0, -1, 1}, "test"); err != nil {
 		t.Fatalf("validateFiniteValues() unexpected error: %v", err)
@@ -173,8 +289,126 @@ func TestModelInspectionErrors(t *testing.T) {
 		t.Fatal("resolveModelIO() returned nil error for a missing model")
 	}
 
-	if _, err := newModelStage(missingPath, ort.NewShape(1)); err == nil {
+	if _, err := newModelStage(missingPath, ort.NewShape(1), Config{}); err == nil {
 		t.Fatal("newModelStage() returned nil error for a missing model")
+	}
+}
+
+func TestNewModelStage(t *testing.T) {
+	originalReader := modelInfoReader
+	originalTensorFactory := modelTensorFactory
+	originalSessionFactory := modelSessionFactory
+	originalOptionsFactory := sessionOptionsFactory
+	defer func() {
+		modelInfoReader = originalReader
+		modelTensorFactory = originalTensorFactory
+		modelSessionFactory = originalSessionFactory
+		sessionOptionsFactory = originalOptionsFactory
+	}()
+
+	dataShape := ort.NewShape(1, 1, SpectrumBins)
+	state := stateShape()
+	modelInfoReader = func(string) ([]ort.InputOutputInfo, []ort.InputOutputInfo, error) {
+		return []ort.InputOutputInfo{
+				{Name: "data-input", Dimensions: dataShape, DataType: ort.TensorElementDataTypeFloat},
+				{Name: "state-input", Dimensions: state, DataType: ort.TensorElementDataTypeFloat},
+			}, []ort.InputOutputInfo{
+				{Name: "data-output", Dimensions: dataShape, DataType: ort.TensorElementDataTypeFloat},
+				{Name: "state-output", Dimensions: state, DataType: ort.TensorElementDataTypeFloat},
+			}, nil
+	}
+
+	createdTensors := make([]*fakeModelTensor, 0, 4)
+	modelTensorFactory = func(ort.Shape) (modelTensor, error) {
+		tensor := &fakeModelTensor{data: make([]float32, 1)}
+		createdTensors = append(createdTensors, tensor)
+
+		return tensor, nil
+	}
+	options := &fakeSessionOptions{}
+	sessionOptionsFactory = func() (modelSessionOptions, error) {
+		return options, nil
+	}
+	session := &fakeModelSession{}
+	modelSessionFactory = func(
+		string,
+		[]string,
+		[]string,
+		[]modelTensor,
+		[]modelTensor,
+		modelSessionOptions,
+	) (modelSession, error) {
+		return session, nil
+	}
+
+	stage, err := newModelStage("model.onnx", dataShape, DefaultConfig())
+	if err != nil {
+		t.Fatalf("newModelStage() error: %v", err)
+	}
+	if stage.session != session {
+		t.Fatal("newModelStage() did not retain session")
+	}
+	if len(createdTensors) != 4 {
+		t.Fatalf("created tensors = %d, want 4", len(createdTensors))
+	}
+	if options.destroyCount != 1 {
+		t.Fatalf("session options destroy count = %d, want 1", options.destroyCount)
+	}
+}
+
+func TestNewModelStageCreationErrors(t *testing.T) {
+	originalReader := modelInfoReader
+	originalTensorFactory := modelTensorFactory
+	originalSessionFactory := modelSessionFactory
+	originalOptionsFactory := sessionOptionsFactory
+	defer func() {
+		modelInfoReader = originalReader
+		modelTensorFactory = originalTensorFactory
+		modelSessionFactory = originalSessionFactory
+		sessionOptionsFactory = originalOptionsFactory
+	}()
+
+	dataShape := ort.NewShape(1, 1, SpectrumBins)
+	state := stateShape()
+	modelInfoReader = func(string) ([]ort.InputOutputInfo, []ort.InputOutputInfo, error) {
+		return []ort.InputOutputInfo{
+				{Name: "data-input", Dimensions: dataShape, DataType: ort.TensorElementDataTypeFloat},
+				{Name: "state-input", Dimensions: state, DataType: ort.TensorElementDataTypeFloat},
+			}, []ort.InputOutputInfo{
+				{Name: "data-output", Dimensions: dataShape, DataType: ort.TensorElementDataTypeFloat},
+				{Name: "state-output", Dimensions: state, DataType: ort.TensorElementDataTypeFloat},
+			}, nil
+	}
+	sessionOptionsFactory = func() (modelSessionOptions, error) {
+		return &fakeSessionOptions{}, nil
+	}
+	modelSessionFactory = func(
+		string,
+		[]string,
+		[]string,
+		[]modelTensor,
+		[]modelTensor,
+		modelSessionOptions,
+	) (modelSession, error) {
+		return nil, errors.New("session failed")
+	}
+
+	for failureIndex := range 5 {
+		t.Run(fmt.Sprintf("failure-%d", failureIndex), func(t *testing.T) {
+			creationIndex := 0
+			modelTensorFactory = func(ort.Shape) (modelTensor, error) {
+				if creationIndex == failureIndex {
+					return nil, errors.New("tensor failed")
+				}
+				creationIndex++
+
+				return &fakeModelTensor{data: make([]float32, 1)}, nil
+			}
+
+			if _, err := newModelStage("model.onnx", dataShape, DefaultConfig()); err == nil {
+				t.Fatal("newModelStage() returned nil creation error")
+			}
+		})
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	ort "github.com/yalue/onnxruntime_go"
 )
 
+// modelIO identifies the data and recurrent state tensors for one model stage
 type modelIO struct {
 	dataInput   string
 	stateInput  string
@@ -14,17 +15,63 @@ type modelIO struct {
 	stateOutput string
 }
 
+// modelSession runs and releases one ONNX model session
 type modelSession interface {
+	// Run executes inference with the tensors bound to the session
 	Run() error
+	// Destroy releases resources owned by the session
 	Destroy() error
 }
 
+// modelTensor provides typed data access and lifecycle control for one tensor
 type modelTensor interface {
+	// GetData returns the mutable tensor values
 	GetData() []float32
+	// ZeroContents clears every tensor value
 	ZeroContents()
+	// Destroy releases resources owned by the tensor
 	Destroy() error
+	// native returns the ONNX Runtime value wrapped by the tensor
+	native() ort.Value
 }
 
+// runtimeModelTensor adapts an ONNX Runtime tensor to modelTensor
+type runtimeModelTensor struct {
+	*ort.Tensor[float32]
+}
+
+// native returns the wrapped ONNX Runtime tensor value
+func (t *runtimeModelTensor) native() ort.Value {
+	return t.Tensor
+}
+
+// modelSessionOptions configures execution for one ONNX model session
+type modelSessionOptions interface {
+	// SetExecutionMode selects sequential or parallel graph execution
+	SetExecutionMode(ort.ExecutionMode) error
+	// SetGraphOptimizationLevel selects the graph optimization level
+	SetGraphOptimizationLevel(ort.GraphOptimizationLevel) error
+	// SetIntraOpNumThreads sets threads used within graph operations
+	SetIntraOpNumThreads(int) error
+	// SetInterOpNumThreads sets threads used across graph operations
+	SetInterOpNumThreads(int) error
+	// Destroy releases resources owned by the options
+	Destroy() error
+	// native returns the wrapped ONNX Runtime session options
+	native() *ort.SessionOptions
+}
+
+// runtimeSessionOptions adapts ONNX Runtime options to modelSessionOptions
+type runtimeSessionOptions struct {
+	*ort.SessionOptions
+}
+
+// native returns the wrapped ONNX Runtime session options
+func (o *runtimeSessionOptions) native() *ort.SessionOptions {
+	return o.SessionOptions
+}
+
+// modelStage owns the tensors and session for one DTLN inference stage
 type modelStage struct {
 	session modelSession
 
@@ -34,17 +81,71 @@ type modelStage struct {
 	stateOutput modelTensor
 }
 
+// modelRunner advances one stateful DTLN inference stage
 type modelRunner interface {
+	// run processes one input tensor and returns the model output
 	run(input []float32) ([]float32, error)
+	// reset clears recurrent and tensor state
 	reset()
+	// close releases resources owned by the model stage
 	close() error
 }
 
-var modelStageFactory = func(path string, dataShape ort.Shape) (modelRunner, error) {
-	return newModelStage(path, dataShape)
+// modelStageFactory creates model stages and can be replaced by tests
+var modelStageFactory = func(path string, dataShape ort.Shape, cfg Config) (modelRunner, error) {
+	return newModelStage(path, dataShape, cfg)
 }
 
+// modelInfoReader reads model tensor metadata and can be replaced by tests
 var modelInfoReader = ort.GetInputOutputInfo
+
+// modelTensorFactory creates model tensors and can be replaced by tests
+var modelTensorFactory = func(shape ort.Shape) (modelTensor, error) {
+	tensor, err := ort.NewEmptyTensor[float32](shape)
+	if err != nil {
+		return nil, err
+	}
+
+	return &runtimeModelTensor{Tensor: tensor}, nil
+}
+
+// modelSessionFactory creates model sessions and can be replaced by tests
+var modelSessionFactory = func(
+	path string,
+	inputNames []string,
+	outputNames []string,
+	inputs []modelTensor,
+	outputs []modelTensor,
+	options modelSessionOptions,
+) (modelSession, error) {
+	nativeInputs := make([]ort.Value, len(inputs))
+	for index, input := range inputs {
+		nativeInputs[index] = input.native()
+	}
+	nativeOutputs := make([]ort.Value, len(outputs))
+	for index, output := range outputs {
+		nativeOutputs[index] = output.native()
+	}
+
+	return ort.NewAdvancedSession(
+		path,
+		inputNames,
+		outputNames,
+		nativeInputs,
+		nativeOutputs,
+		options.native(),
+	)
+}
+
+// sessionOptionsFactory creates session options and can be replaced by tests
+var sessionOptionsFactory = func() (modelSessionOptions, error) {
+	options, err := ort.NewSessionOptions()
+	if err != nil {
+		return nil, err
+	}
+
+	return &runtimeSessionOptions{SessionOptions: options}, nil
+}
 
 // stateShape returns the recurrent DTLN state shape
 //
@@ -58,7 +159,7 @@ func stateShape() ort.Shape {
 }
 
 // newModelStage creates one DTLN ONNX inference stage
-func newModelStage(path string, dataShape ort.Shape) (*modelStage, error) {
+func newModelStage(path string, dataShape ort.Shape, cfg Config) (*modelStage, error) {
 	ioNames, err := resolveModelIO(path, dataShape)
 	if err != nil {
 		return nil, err
@@ -66,13 +167,13 @@ func newModelStage(path string, dataShape ort.Shape) (*modelStage, error) {
 
 	stage := &modelStage{}
 
-	dataInput, err := ort.NewEmptyTensor[float32](dataShape)
+	dataInput, err := modelTensorFactory(dataShape)
 	if err != nil {
 		return nil, fmt.Errorf("create data input tensor: %w", err)
 	}
 	stage.dataInput = dataInput
 
-	stateInput, err := ort.NewEmptyTensor[float32](stateShape())
+	stateInput, err := modelTensorFactory(stateShape())
 	if err != nil {
 		_ = stage.close()
 
@@ -80,7 +181,7 @@ func newModelStage(path string, dataShape ort.Shape) (*modelStage, error) {
 	}
 	stage.stateInput = stateInput
 
-	dataOutput, err := ort.NewEmptyTensor[float32](dataShape)
+	dataOutput, err := modelTensorFactory(dataShape)
 	if err != nil {
 		_ = stage.close()
 
@@ -88,7 +189,7 @@ func newModelStage(path string, dataShape ort.Shape) (*modelStage, error) {
 	}
 	stage.dataOutput = dataOutput
 
-	stateOutput, err := ort.NewEmptyTensor[float32](stateShape())
+	stateOutput, err := modelTensorFactory(stateShape())
 	if err != nil {
 		_ = stage.close()
 
@@ -99,10 +200,25 @@ func newModelStage(path string, dataShape ort.Shape) (*modelStage, error) {
 	inputNames := []string{ioNames.dataInput, ioNames.stateInput}
 	outputNames := []string{ioNames.dataOutput, ioNames.stateOutput}
 
-	inputs := []ort.Value{dataInput, stateInput}
-	outputs := []ort.Value{dataOutput, stateOutput}
+	inputs := []modelTensor{dataInput, stateInput}
+	outputs := []modelTensor{dataOutput, stateOutput}
 
-	stage.session, err = ort.NewAdvancedSession(path, inputNames, outputNames, inputs, outputs, nil)
+	sessionOptions, err := newSessionOptions(cfg)
+	if err != nil {
+		_ = stage.close()
+
+		return nil, err
+	}
+	defer func() { _ = sessionOptions.Destroy() }()
+
+	stage.session, err = modelSessionFactory(
+		path,
+		inputNames,
+		outputNames,
+		inputs,
+		outputs,
+		sessionOptions,
+	)
 	if err != nil {
 		_ = stage.close()
 
@@ -110,6 +226,39 @@ func newModelStage(path string, dataShape ort.Shape) (*modelStage, error) {
 	}
 
 	return stage, nil
+}
+
+// newSessionOptions creates optimized sequential options using the configured thread counts
+func newSessionOptions(cfg Config) (modelSessionOptions, error) {
+	options, err := sessionOptionsFactory()
+	if err != nil {
+		return nil, fmt.Errorf("create ONNX session options: %w", err)
+	}
+
+	configure := func(err error, name string) (modelSessionOptions, error) {
+		if err == nil {
+			return options, nil
+		}
+
+		_ = options.Destroy()
+
+		return nil, fmt.Errorf("configure ONNX %s: %w", name, err)
+	}
+
+	if _, err := configure(options.SetExecutionMode(ort.ExecutionModeSequential), "execution mode"); err != nil {
+		return nil, err
+	}
+	if _, err := configure(options.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableAll), "graph optimization"); err != nil {
+		return nil, err
+	}
+	if _, err := configure(options.SetIntraOpNumThreads(cfg.IntraOpNumThreads), "intra-op threads"); err != nil {
+		return nil, err
+	}
+	if _, err := configure(options.SetInterOpNumThreads(cfg.InterOpNumThreads), "inter-op threads"); err != nil {
+		return nil, err
+	}
+
+	return options, nil
 }
 
 // resolveModelIO discovers DTLN tensor names using their expected shapes
